@@ -1,0 +1,285 @@
+import requests
+import time
+import pandas as pd
+from datetime import datetime, timedelta
+import os
+
+# --- CONFIGURATION ---
+API_KEY = "API KEY"
+DAYS_TO_SCAN = 30
+WEI_IN_ETH = 10**18
+WHITELIST_FILE = "trader_agent_ids.txt"
+
+# --- OUTPUT PATH ---
+OUTPUT_DIR = "[OUTPUT DIRECTORY]"
+OUTPUT_FILE = "agent_composite_bet_data_filtered.csv"
+FULL_PATH = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
+
+# ENDPOINTS
+SUBGRAPH_TRADES = f"https://gateway.thegraph.com/api/{API_KEY}/subgraphs/id/9fUVQpFwzpdWS9bq5WkAnmKbNNcoBwatMR4yZq81pbbz"
+
+def load_whitelist():
+    """Loads approved agent addresses from a text file."""
+    if not os.path.exists(WHITELIST_FILE):
+        print(f"⚠️ Warning: '{WHITELIST_FILE}' not found. No filtering applied.")
+        return None
+    with open(WHITELIST_FILE, 'r') as f:
+        return set(line.strip().lower() for line in f if line.strip())
+
+def run_query(url, query, variables=None):
+    """Robust query execution with retry logic."""
+    for attempt in range(3):
+        try:
+            response = requests.post(url, json={'query': query, 'variables': variables})
+            if response.status_code == 200:
+                return response.json()
+            time.sleep(0.5)
+        except Exception:
+            time.sleep(1)
+    return None
+
+def fetch_active_traders():
+    """Discovery Phase: Finds all unique agent addresses active in last 30 days."""
+    print(f"🔎 Discovery Phase: Finding agents active in last {DAYS_TO_SCAN} days...")
+    
+    start_date = datetime.now() - timedelta(days=DAYS_TO_SCAN)
+    min_timestamp = int(start_date.timestamp())
+    active_agents = set()
+    last_timestamp = int(datetime.now().timestamp())
+    
+    while True:
+        query = """
+        query Discovery($maxTime: BigInt!, $minTime: BigInt!) {
+            fpmmTrades(
+                where: { creationTimestamp_lt: $maxTime, creationTimestamp_gt: $minTime }
+                first: 1000
+                orderBy: creationTimestamp
+                orderDirection: desc
+            ) {
+                creationTimestamp
+                creator { id }
+            }
+        }
+        """
+        variables = {"maxTime": str(last_timestamp), "minTime": str(min_timestamp)}
+        data = run_query(SUBGRAPH_TRADES, query, variables)
+        
+        if not data or "data" not in data: break
+        trades = data["data"].get("fpmmTrades", [])
+        if not trades: break
+        
+        for t in trades:
+            if t.get("creator"):
+                active_agents.add(t["creator"]["id"].lower())
+        
+        last_timestamp = trades[-1]["creationTimestamp"]
+        if len(trades) < 1000: break
+
+    # --- FILTER LOGIC ---
+    whitelist = load_whitelist()
+    if whitelist:
+        initial_count = len(active_agents)
+        active_agents = {a for a in active_agents if a in whitelist}
+        print(f"🧹 Filter Applied: {initial_count} active addresses -> {len(active_agents)} verified Olas agents.")
+
+    print(f"✅ Total Active Traders Found: {len(active_agents)}\n")
+    return list(active_agents)
+
+def format_outcome_label(fpmm, index):
+    """Maps index to human readable label."""
+    try:
+        if fpmm.get("outcomes") and len(fpmm["outcomes"]) > int(index):
+            return fpmm["outcomes"][int(index)]
+        return str(index)
+    except:
+        return str(index)
+
+def analyze_agent_composite_bets(agent_address):
+    """
+    Aggregates ALL trades for a specific Market+Outcome into a single 'Composite Bet'.
+    Calculates Net ROI based on total entries and total exits.
+    """
+    # Dictionary to hold the composite state of each position
+    # Key: (MarketID, OutcomeIndex) -> Value: {stats}
+    positions = {}
+    
+    last_timestamp = int(datetime.now().timestamp())
+    
+    # 1. Fetch All Trades
+    while True:
+        query = """
+        query GetHistory($user: String!, $maxTime: BigInt!) {
+            fpmmTrades(
+                where: { creator: $user, creationTimestamp_lt: $maxTime }
+                first: 1000
+                orderBy: creationTimestamp
+                orderDirection: desc
+            ) {
+                id
+                creationTimestamp
+                type
+                collateralAmount
+                feeAmount
+                outcomeTokensTraded
+                outcomeIndex
+                fpmm { 
+                    id
+                    currentAnswer 
+                    outcomes
+                    question { title } 
+                }
+            }
+        }
+        """
+        variables = {"user": agent_address, "maxTime": str(last_timestamp)}
+        data = run_query(SUBGRAPH_TRADES, query, variables)
+        
+        if not data or "data" not in data: break
+        trades = data["data"].get("fpmmTrades", [])
+        if not trades: break
+        
+        for t in trades:
+            market = t.get("fpmm")
+            if not market: continue
+
+            mid = market["id"]
+            oid = t["outcomeIndex"]
+            key = (mid, oid)
+            
+            # Initialize Position if new
+            if key not in positions:
+                positions[key] = {
+                    "market_data": market,
+                    "first_trade_id": t["id"], # We use the first ID found (recent) as a reference, or you can sort later
+                    "last_trade_ts": t["creationTimestamp"],
+                    "total_invested": 0.0,
+                    "cash_from_sells": 0.0,
+                    "tokens_held": 0.0,
+                    "trade_count": 0
+                }
+            
+            # --- AGGREGATION LOGIC ---
+            amount = float(t["collateralAmount"]) / WEI_IN_ETH
+            fees = float(t["feeAmount"]) / WEI_IN_ETH
+            tokens = float(t["outcomeTokensTraded"]) / WEI_IN_ETH
+            
+            p = positions[key]
+            p["trade_count"] += 1
+            
+            if t["type"] == "Buy":
+                p["total_invested"] += (amount + fees)
+                p["tokens_held"] += tokens
+            elif t["type"] == "Sell":
+                p["cash_from_sells"] += amount
+                p["tokens_held"] -= tokens
+
+        last_timestamp = trades[-1]["creationTimestamp"]
+        if len(trades) < 1000: break
+        
+    # 2. Calculate Final Metrics for each Composite Position
+    rows = []
+    
+    for (mid, oid), p in positions.items():
+        market = p["market_data"]
+        
+        # --- CLOSE CONDITION CHECK ---
+        is_market_resolved = market.get("currentAnswer") is not None
+        is_fully_sold = p["tokens_held"] < 0.001 # Treat dust as 0
+        
+        # We only want CLOSED bets.
+        # That means:
+        # A) The Market has finished (Resolved)
+        # OR 
+        # B) The Agent has fully exited the position (Sold Everything)
+        if not is_market_resolved and not is_fully_sold:
+            continue # Skip active/open positions
+            
+        # --- REVENUE CALCULATION ---
+        revenue = p["cash_from_sells"] # Start with cash banked from sells
+        
+        result_status = "EXITED" # Default if sold out
+        
+        if is_market_resolved:
+            # If resolved, check if remaining tokens are winners
+            try:
+                winning_index = int(market["currentAnswer"], 16)
+                picked_index = int(oid)
+                
+                if winning_index == picked_index:
+                    # WINNER: Remaining tokens redeem $1.00 each
+                    revenue += p["tokens_held"]
+                    result_status = "WIN"
+                else:
+                    # LOSER: Remaining tokens are worth $0.00
+                    result_status = "LOSS"
+            except:
+                result_status = "ERROR"
+        else:
+            # Market is still open, but we sold out.
+            # If we made profit, call it a 'WIN' (Trading Win), else 'LOSS'
+            if revenue > p["total_invested"]:
+                 result_status = "WIN (Trade)"
+            else:
+                 result_status = "LOSS (Trade)"
+
+        cost = p["total_invested"]
+        roi_val = 0.0
+        
+        if cost > 0:
+            roi_val = ((revenue - cost) / cost) * 100
+        elif revenue > 0:
+            roi_val = 100.0 # Infinite ROI edge case (received tokens for free? unlikely)
+            
+        # Meta Data Construction
+        pick_label = format_outcome_label(market, oid)
+        bet_description = market["question"]["title"] if market.get("question") else "Unknown"
+        
+        rows.append({
+            "AGENT_ADDRESS": agent_address,
+            "TRADE_ID": p["first_trade_id"], # Representative ID
+            "BET_DESCRIPTION": bet_description,
+            "PICK": pick_label,
+            "RESULT": result_status,
+            "ROI": roi_val,
+            "COST": cost,
+            "REVENUE": revenue,
+            "TRADE_COUNT": p["trade_count"],
+            "DATE": datetime.fromtimestamp(int(p["last_trade_ts"])).strftime('%Y-%m-%d')
+        })
+        
+    return rows
+
+def main():
+    # 1. Discovery
+    active_agents = fetch_active_traders()
+    if not active_agents:
+        print("No active agents found.")
+        return
+
+    # 2. Analysis
+    all_data = []
+    print(f"📊 Analyzing COMPOSITE bets for {len(active_agents)} agents...")
+    
+    for i, agent in enumerate(active_agents):
+        print(f"\rProcessing Agent {i+1}/{len(active_agents)}: {agent}", end="", flush=True)
+        agent_rows = analyze_agent_composite_bets(agent)
+        all_data.extend(agent_rows)
+        
+    print("\n\n✅ Analysis Complete. Generating DataFrame...")
+    
+    # 3. Export
+    df = pd.DataFrame(all_data)
+    
+    print("\n--- DataFrame Preview ---")
+    print(df.head())
+    
+    try:
+        df.to_csv(FULL_PATH, index=False)
+        print(f"\n📂 Successfully saved file to: {FULL_PATH}")
+    except Exception as e:
+        print(f"\n❌ Error saving file: {e}")
+        df.to_csv("agent_composite_bet_data.csv", index=False)
+        print("   Saved to current directory instead.")
+
+if __name__ == "__main__":
+    main()
